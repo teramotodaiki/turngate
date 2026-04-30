@@ -8,8 +8,10 @@ import {
   getLatestTurnIdFromEvents,
   getStatePaths,
   hasTaskCompleteForTurn,
+  isTurnActiveFromEvents,
   normalizeResourceNames,
   normalizeState,
+  parseDurationMs,
   pruneInactiveGateRecords,
 } from "../src/codex-concurrency.mjs";
 
@@ -24,9 +26,12 @@ test("getLatestTurnIdFromEvents は最後の turn_context を返す", () => {
 });
 
 test("getLatestTurnIdFromEvents は turn_context が無ければ task_started を使う", () => {
-  const events = [{ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } }];
+  const events = [
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+  ];
 
-  assert.equal(getLatestTurnIdFromEvents(events), "turn-1");
+  assert.equal(getLatestTurnIdFromEvents(events), "turn-2");
 });
 
 test("getCurrentTurnIdFromEvents は完了済みでない最新 turn を返す", () => {
@@ -40,6 +45,18 @@ test("getCurrentTurnIdFromEvents は完了済みでない最新 turn を返す",
   assert.equal(getCurrentTurnIdFromEvents(events), "turn-2");
 });
 
+test("getCurrentTurnIdFromEvents は最新 turn が完了済みなら古い未完了 turn に戻らない", () => {
+  const events = [
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+    { type: "turn_context", payload: { turn_id: "turn-1" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+    { type: "turn_context", payload: { turn_id: "turn-2" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-2" } },
+  ];
+
+  assert.equal(getCurrentTurnIdFromEvents(events), "");
+});
+
 test("hasTaskCompleteForTurn は一致する task_complete だけを拾う", () => {
   const events = [
     { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
@@ -48,6 +65,28 @@ test("hasTaskCompleteForTurn は一致する task_complete だけを拾う", () 
 
   assert.equal(hasTaskCompleteForTurn(events, "turn-2"), true);
   assert.equal(hasTaskCompleteForTurn(events, "turn-3"), false);
+});
+
+test("isTurnActiveFromEvents は task_complete の無い turn でも後続 turn 開始後は inactive とみなす", () => {
+  const events = [
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+    { type: "turn_context", payload: { turn_id: "turn-1" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+    { type: "turn_context", payload: { turn_id: "turn-2" } },
+  ];
+
+  assert.equal(isTurnActiveFromEvents(events, "turn-1"), false);
+  assert.equal(isTurnActiveFromEvents(events, "turn-2"), true);
+});
+
+test("isTurnActiveFromEvents は task_complete がある turn を inactive とみなす", () => {
+  const events = [
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+    { type: "turn_context", payload: { turn_id: "turn-1" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+  ];
+
+  assert.equal(isTurnActiveFromEvents(events, "turn-1"), false);
 });
 
 test("normalizeState は壊れた値を空 state へ直す", () => {
@@ -60,6 +99,13 @@ test("normalizeResourceNames は空要素と重複を落とす", () => {
     "git:branch:main",
     "deploy:env:production",
   ]);
+});
+
+test("parseDurationMs は ms/s/m の duration をミリ秒に変換する", () => {
+  assert.equal(parseDurationMs("500ms"), 500);
+  assert.equal(parseDurationMs("5s"), 5000);
+  assert.equal(parseDurationMs("10m"), 600000);
+  assert.throws(() => parseDurationMs("42"), /500ms, 5s, 10m/);
 });
 
 test("claimResources は空き resource 群をまとめて claim できる", () => {

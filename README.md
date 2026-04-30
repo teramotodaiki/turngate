@@ -50,11 +50,13 @@ codex-concurrency claim git:branch:main deploy:env:production
 codex-concurrency claim deploy:env:staging
 ```
 
-If another active turn already owns any requested resource, the claim fails.
+If another active turn already owns any requested resource, the claim waits until ownership is reclaimable or the timeout expires.
 
 If the same active turn claims additional resources, the ownership is expanded.
 
-When the owning turn completes, the resources become reclaimable automatically.
+When the owning turn completes or the same thread moves on to a later turn, the resources become reclaimable automatically.
+
+By default, `claim` waits for blocked resources to become reclaimable for up to 10 minutes. Use `--no-wait` when a workflow needs the older fail-fast behavior.
 
 ## Commands
 
@@ -63,7 +65,7 @@ When the owning turn completes, the resources become reclaimable automatically.
 Claims one or more resources for the current Codex turn.
 
 ```bash
-codex-concurrency claim <resource>... [--label <text>] [--json]
+codex-concurrency claim <resource>... [--label <text>] [--json] [--wait|--no-wait] [--timeout <duration>] [--poll-interval <duration>]
 ```
 
 Examples:
@@ -78,8 +80,20 @@ Behavior:
 
 - succeeds if all requested resources are free
 - succeeds if the same active turn already owns some of them and needs to add more
-- fails if any requested resource is owned by another active turn
+- waits if any requested resource is owned by another active turn
+- fails after the wait timeout if another active turn still owns any requested resource
 - may reclaim resources from inactive owners during the same operation
+
+Waiting:
+
+- enabled by default for `claim`
+- `--wait` can be used to make that behavior explicit
+- `--no-wait` restores fail-fast behavior
+- default timeout: `10m`
+- maximum timeout: `10m`
+- default poll interval: `5s`
+- duration values accept `ms`, `s`, or `m`, for example `500ms`, `5s`, `10m`
+- an immediate wait notice and repeated progress messages are written to stderr, so Codex can see that the CLI is still waiting while `--json` keeps stdout machine-readable
 
 Possible statuses:
 
@@ -88,6 +102,7 @@ Possible statuses:
 - `already-owner`: the same active turn already owned all requested resources
 - `reclaimed`: one or more inactive owners were replaced
 - `blocked`: another active turn owns at least one requested resource
+- `timeout`: only emitted by the CLI when waiting expires
 
 ### `status`
 
@@ -165,19 +180,22 @@ The owner record stored in state includes:
 
 The most important detail is that ownership is attached to a Codex turn, not a shell process.
 
-## How completion is detected
+## How activity is detected
 
-The tool reads the local Codex session log under `CODEX_HOME` and checks whether the owning turn has emitted `task_complete`.
+The tool reads the local Codex session log under `CODEX_HOME` and checks whether the owning turn is still the current active turn in that thread.
 
-If a turn is complete, its ownership is treated as inactive and can be pruned or reclaimed.
+Ownership is treated as inactive and can be pruned or reclaimed when either:
+
+- the owning turn emits `task_complete`
+- a later turn starts in the same thread, even if the older turn never emitted `task_complete`
 
 That means:
 
 - no manual unlock is required
-- abandoned claims do not stay forever
-- a new turn can reclaim resources owned by a completed turn
+- abandoned claims are released once the session records completion or a later turn
+- a new turn can reclaim resources owned by a completed or superseded turn
 
-This behavior is deliberate. If a turn ends while waiting for a human response, its resources are considered releasable.
+This behavior is deliberate. If a turn ends while waiting for a human response and the same thread later continues with a new turn, the older turn's resources are considered releasable.
 
 ## Where state is stored
 
@@ -222,6 +240,8 @@ The file lock only protects state mutation. It is not the long-lived protection 
 
 Long-lived protection comes from the claimed resources stored in `state.json`, which are tied to active Codex turns.
 
+When `claim` is waiting, it does not hold the state file lock while sleeping. Each retry briefly takes the file lock, prunes completed owners, attempts the claim, then releases the file lock before the next poll. This keeps multiple waiting Codex turns from blocking each other at the state-file layer.
+
 ## What it guarantees
 
 - only one active Codex turn can own a given resource at a time
@@ -236,6 +256,7 @@ Long-lived protection comes from the claimed resources stored in `state.json`, w
 - it does not understand repository semantics by itself
 - it does not know which resources your workflow should claim
 - it does not coordinate across different repositories
+- it does not guarantee strict FIFO ordering among multiple waiters
 - it does not replace Git conflict resolution
 
 You still need to choose sensible resource names and call the tool at the right points in your workflow.
@@ -288,6 +309,12 @@ Claim staging only from a feature branch workflow:
 
 ```bash
 codex-concurrency claim deploy:env:staging --label "staging deploy"
+```
+
+Fail fast instead of waiting:
+
+```bash
+codex-concurrency claim deploy:env:staging --label "staging deploy" --no-wait
 ```
 
 ## Naming resources
