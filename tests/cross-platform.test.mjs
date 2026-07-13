@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   claim,
   claimResources,
+  commandVersion,
   createEmptyState,
   doctor,
   getClaimant,
@@ -235,6 +236,20 @@ test("version checks reject Claude Code releases without complete-quiescence fie
   assert.equal(versionAtLeast("2.1.144 (Claude Code)", "2.1.145"), false);
   assert.equal(versionAtLeast("2.1.145 (Claude Code)", "2.1.145"), true);
   assert.equal(versionAtLeast("2.2.0 (Claude Code)", "2.1.145"), true);
+});
+
+test("version checks resolve Windows command shims through cmd.exe", () => {
+  let invocation;
+  const version = commandVersion("codex", {
+    systemPlatform: "win32",
+    spawn: (command, args, options) => {
+      invocation = { command, args, options };
+      return { status: 0, stdout: "codex-cli 0.144.1\n", stderr: "" };
+    },
+  });
+  assert.equal(version, "codex-cli 0.144.1");
+  assert.equal(invocation.args.at(-1), "codex --version");
+  assert.equal(invocation.options.shell, undefined);
 });
 
 test("doctor reports missing hooks, trust state, and a writable runtime", () => {

@@ -631,8 +631,10 @@ export function setupHooks({ host = "all", dryRun = false, home = homedir(), exe
   return results;
 }
 
-function commandVersion(command) {
-  const result = spawnSync(command, ["--version"], { encoding: "utf8" });
+export function commandVersion(command, { systemPlatform = platform(), spawn = spawnSync } = {}) {
+  const executable = systemPlatform === "win32" ? process.env.ComSpec || "cmd.exe" : command;
+  const args = systemPlatform === "win32" ? ["/d", "/s", "/c", `${command} --version`] : ["--version"];
+  const result = spawn(executable, args, { encoding: "utf8" });
   return result.status === 0 ? (result.stdout || result.stderr || "").trim() : "unavailable";
 }
 
