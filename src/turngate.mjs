@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Compatibility entry point for imports and older absolute bin paths.
+// Public module entry point.
 export * from "./core.mjs";
 export { runCli } from "./cli.mjs";
 
@@ -19,7 +19,7 @@ const isMain = (() => {
 
 if (isMain) {
   runCli().catch((error) => {
-    console.error(`[codex-concurrency] ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`[turngate] ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   });
 }

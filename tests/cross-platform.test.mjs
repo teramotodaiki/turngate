@@ -35,7 +35,7 @@ import {
 const temporaryDirectories = [];
 const execFileAsync = promisify(execFile);
 
-function temporaryDirectory(prefix = "codex-concurrency-test-") {
+function temporaryDirectory(prefix = "turngate-test-") {
   const directory = mkdtempSync(join(tmpdir(), prefix));
   temporaryDirectories.push(directory);
   return directory;
@@ -61,7 +61,7 @@ function owner(overrides = {}) {
 }
 
 function paths() {
-  return getRepositoryPaths(join(temporaryDirectory(), ".git"), temporaryDirectory("codex-concurrency-runtime-"));
+  return getRepositoryPaths(join(temporaryDirectory(), ".git"), temporaryDirectory("turngate-runtime-"));
 }
 
 test("state normalization keeps only v2 owners", () => {
@@ -159,7 +159,7 @@ test("Claude Stop retains gates while background work or crons remain", async ()
   const base = { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" };
   await handleHookEvent("claude", { hook_event_name: "SessionStart", session_id: "s", transcript_path: "", cwd: "C:/fake" }, base);
   const started = await handleHookEvent("claude", { hook_event_name: "UserPromptSubmit", session_id: "s", transcript_path: "", cwd: "C:/fake", prompt_id: "turn-1" }, base);
-  const claimant = getClaimant(repoPaths, "test", { CODEX_CONCURRENCY_PROVIDER: "claude", CODEX_CONCURRENCY_SESSION_ID: "s" }, "C:/fake");
+  const claimant = getClaimant(repoPaths, "test", { TURNGATE_PROVIDER: "claude", TURNGATE_SESSION_ID: "s" }, "C:/fake");
   await claim(repoPaths, ["deploy:poc"], claimant);
   const retained = await handleHookEvent(
     "claude",
@@ -176,7 +176,7 @@ test("Claude quiescent Stop releases every gate owned by the turn", async () => 
   const base = { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" };
   await handleHookEvent("claude", { hook_event_name: "SessionStart", session_id: "s", transcript_path: "", cwd: "C:/fake" }, base);
   await handleHookEvent("claude", { hook_event_name: "UserPromptSubmit", session_id: "s", transcript_path: "", cwd: "C:/fake", prompt_id: "turn-1" }, base);
-  const claimant = getClaimant(repoPaths, "test", { CODEX_CONCURRENCY_PROVIDER: "claude", CODEX_CONCURRENCY_SESSION_ID: "s" }, "C:/fake");
+  const claimant = getClaimant(repoPaths, "test", { TURNGATE_PROVIDER: "claude", TURNGATE_SESSION_ID: "s" }, "C:/fake");
   await claim(repoPaths, ["deploy:poc", "git:main"], claimant);
   const released = await handleHookEvent(
     "claude",
@@ -213,6 +213,22 @@ test("setup merges existing hooks, is idempotent, and dry-run does not write", (
   const dryRun = setupHooks({ host: "codex", home, executablePath: "D:/new/cli.mjs", dryRun: true });
   assert.equal(dryRun[0].changed, true);
   assert.equal(readFileSync(codexFile, "utf8"), before);
+});
+
+test("setup replaces legacy managed hooks without removing unrelated hooks", () => {
+  const legacy = {
+    hooks: {
+      Stop: [
+        { hooks: [{ type: "command", command: 'node "C:/node_modules/codex-concurrency/src/cli.mjs" hook codex', statusMessage: "Updating concurrency ownership" }] },
+        { hooks: [{ type: "command", command: "other-tool hook codex" }] },
+      ],
+    },
+  };
+  const result = mergeHookConfig(legacy, "codex", "C:/node_modules/turngate/src/cli.mjs");
+  const commands = result.hooks.Stop.flatMap((group) => group.hooks.map((hook) => hook.command));
+  assert.equal(commands.some((command) => command.includes("codex-concurrency")), false);
+  assert.equal(commands.some((command) => command === "other-tool hook codex"), true);
+  assert.equal(commands.some((command) => command.includes("turngate")), true);
 });
 
 test("setup fails closed instead of replacing malformed settings", () => {
@@ -254,8 +270,8 @@ test("version checks resolve Windows command shims through cmd.exe", () => {
 
 test("doctor reports missing hooks, trust state, and a writable runtime", () => {
   const home = temporaryDirectory();
-  const runtime = temporaryDirectory("codex-concurrency-doctor-");
-  const result = doctor({ cwd: process.cwd(), home, env: { ...process.env, CODEX_CONCURRENCY_HOME: runtime, CODEX_THREAD_ID: "" } });
+  const runtime = temporaryDirectory("turngate-doctor-");
+  const result = doctor({ cwd: process.cwd(), home, env: { ...process.env, TURNGATE_HOME: runtime, CODEX_THREAD_ID: "" } });
   assert.equal(result.checks.find((check) => check.name === "codex-hooks").ok, false);
   assert.equal(result.checks.find((check) => check.name === "claude-hooks").ok, false);
   assert.equal(result.checks.find((check) => check.name === "runtime-state").ok, true);

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Turngate"
+  short_description: "Share repository gates across local coding agents"
+  default_prompt: "Use $turngate before modifying this repository so the active turn owns the required gate."

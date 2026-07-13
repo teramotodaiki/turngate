@@ -16,7 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 export const STATE_VERSION = 2;
-export const HOOK_ID = "codex-concurrency-v2";
+export const HOOK_ID = "turngate-v1";
 export const DEFAULT_CLAIM_TIMEOUT_MS = 10 * 60 * 1000;
 export const MAX_CLAIM_TIMEOUT_MS = 10 * 60 * 1000;
 export const DEFAULT_POLL_INTERVAL_MS = 5 * 1000;
@@ -123,7 +123,7 @@ export function repositoryId(gitCommonDir) {
 }
 
 export function getRuntimeRoot(env = process.env) {
-  return resolve(env.CODEX_CONCURRENCY_HOME || join(tmpdir(), "codex-concurrency"));
+  return resolve(env.TURNGATE_HOME || join(tmpdir(), "turngate"));
 }
 
 export function getGitCommonDir(cwd = process.cwd()) {
@@ -188,7 +188,7 @@ function pidIsAlive(pid) {
 
 function lockIsRecoverable(lockDir) {
   const owner = readJson(join(lockDir, "owner.json"), null);
-  if (!owner) return true;
+  if (!owner) return false;
   if (owner.hostname !== hostname()) return false;
   return !pidIsAlive(owner.pid);
 }
@@ -217,11 +217,18 @@ export async function withDirectoryLock(lockDir, callback, options = {}) {
       }
       if (!["EEXIST", "EACCES", "EPERM"].includes(error?.code)) throw error;
       if (lockIsRecoverable(lockDir)) {
+        const staleDir = `${lockDir}.stale-${process.pid}-${randomUUID()}`;
         try {
-          rmSync(lockDir, { recursive: true });
+          renameSync(lockDir, staleDir);
+          rmSync(staleDir, { recursive: true });
           continue;
         } catch (removeError) {
-          if (removeError?.code !== "ENOENT") throw removeError;
+          try {
+            rmSync(staleDir, { recursive: true });
+          } catch (cleanupError) {
+            if (cleanupError?.code !== "ENOENT") throw cleanupError;
+          }
+          if (!["ENOENT", "EEXIST", "EACCES", "EPERM"].includes(removeError?.code)) throw removeError;
         }
       }
       if (Date.now() >= deadline) throw new Error(`state lock timed out: ${lockDir}`);
@@ -231,9 +238,18 @@ export async function withDirectoryLock(lockDir, callback, options = {}) {
   try {
     return await callback();
   } finally {
+    const releaseDir = `${lockDir}.release-${process.pid}-${token}`;
     try {
-      if (readJson(join(lockDir, "owner.json"), null)?.token === token) rmSync(lockDir, { recursive: true });
+      if (readJson(join(lockDir, "owner.json"), null)?.token === token) {
+        renameSync(lockDir, releaseDir);
+        rmSync(releaseDir, { recursive: true });
+      }
     } catch (error) {
+      try {
+        rmSync(releaseDir, { recursive: true });
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") throw cleanupError;
+      }
       if (error?.code !== "ENOENT") throw error;
     }
   }
@@ -357,13 +373,13 @@ export async function pruneState(paths, state = loadState(paths.stateFile)) {
 }
 
 function detectProvider(env = process.env) {
-  if (env.CODEX_CONCURRENCY_PROVIDER === "claude" || env.CODEX_CONCURRENCY_PROVIDER === "codex") return env.CODEX_CONCURRENCY_PROVIDER;
+  if (env.TURNGATE_PROVIDER === "claude" || env.TURNGATE_PROVIDER === "codex") return env.TURNGATE_PROVIDER;
   if (env.CODEX_THREAD_ID) return "codex";
   return "";
 }
 
 function detectSessionId(provider, env = process.env) {
-  if (env.CODEX_CONCURRENCY_SESSION_ID) return env.CODEX_CONCURRENCY_SESSION_ID;
+  if (env.TURNGATE_SESSION_ID) return env.TURNGATE_SESSION_ID;
   if (provider === "codex") return env.CODEX_THREAD_ID ?? "";
   return "";
 }
@@ -371,10 +387,10 @@ function detectSessionId(provider, env = process.env) {
 export function getClaimant(paths, label = "", env = process.env, cwd = process.cwd()) {
   const provider = detectProvider(env);
   const sessionId = detectSessionId(provider, env);
-  if (!provider || !sessionId) throw new Error("active Codex/Claude session could not be identified; run codex-concurrency setup and doctor");
+  if (!provider || !sessionId) throw new Error("active Codex/Claude session could not be identified; run turngate setup and doctor");
   const lifecycle = readLifecycle(paths, provider, sessionId);
   if (!lifecycle || !["active", "paused"].includes(lifecycle.status) || !lifecycle.turnId) {
-    throw new Error(`active ${provider} turn is not registered; verify lifecycle hooks with codex-concurrency doctor`);
+    throw new Error(`active ${provider} turn is not registered; verify lifecycle hooks with turngate doctor`);
   }
   return {
     provider,
@@ -474,8 +490,8 @@ function appendClaudeEnvironment(input) {
   const envFile = process.env.CLAUDE_ENV_FILE;
   if (!envFile) return;
   const lines = [
-    "export CODEX_CONCURRENCY_PROVIDER=claude",
-    `export CODEX_CONCURRENCY_SESSION_ID=${JSON.stringify(input.session_id)}`,
+    "export TURNGATE_PROVIDER=claude",
+    `export TURNGATE_SESSION_ID=${JSON.stringify(input.session_id)}`,
   ];
   appendFileSync(envFile, `${lines.join("\n")}\n`, "utf8");
 }
@@ -573,17 +589,21 @@ function hookHandler(provider, executablePath) {
       command: process.execPath,
       args: [executablePath, "hook", provider],
       timeout: 30,
-      statusMessage: "Updating concurrency ownership",
+      statusMessage: "Updating turngate ownership",
     };
   }
-  return { type: "command", command: hookCommand(provider, executablePath), timeout: 30, statusMessage: "Updating concurrency ownership" };
+  return { type: "command", command: hookCommand(provider, executablePath), timeout: 30, statusMessage: "Updating turngate ownership" };
 }
 
 function isManagedHook(hook, provider) {
-  return (
-    (typeof hook?.command === "string" && hook.command.includes(` hook ${provider}`)) ||
-    (Array.isArray(hook?.args) && hook.args.length >= 2 && hook.args.at(-2) === "hook" && hook.args.at(-1) === provider)
-  );
+  const markers = ["turngate", "codex-concurrency"];
+  const managedStatus = ["Updating turngate ownership", "Updating concurrency ownership"].includes(hook?.statusMessage);
+  const command = typeof hook?.command === "string" ? hook.command.toLowerCase() : "";
+  const directExecutable = Array.isArray(hook?.args) && typeof hook.args[0] === "string" ? hook.args[0].toLowerCase() : "";
+  const isHookInvocation =
+    command.includes(` hook ${provider}`) ||
+    (Array.isArray(hook?.args) && hook.args.length >= 2 && hook.args.at(-2) === "hook" && hook.args.at(-1) === provider);
+  return isHookInvocation && (managedStatus || markers.some((marker) => command.includes(marker) || directExecutable.includes(marker)));
 }
 
 export function mergeHookConfig(existing, provider, executablePath) {

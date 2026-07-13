@@ -1,6 +1,6 @@
-# codex-concurrency
+# turngate
 
-`codex-concurrency` coordinates shared repository operations across local Codex and Claude Code turns.
+`turngate` coordinates shared repository operations across local Codex and Claude Code turns.
 
 It supports the four local combinations below with one shared gate state per Git repository:
 
@@ -40,34 +40,34 @@ The tool intentionally fails closed if it cannot identify an active configured a
 Install globally:
 
 ```bash
-pnpm add -g codex-concurrency
+pnpm add -g turngate
 ```
 
 or:
 
 ```bash
-npm install -g codex-concurrency
+npm install -g turngate
 ```
 
 Install the user-level lifecycle hooks for both hosts:
 
 ```bash
-codex-concurrency setup
+turngate setup
 ```
 
-The package also includes the `skills/codex-concurrency` agent skill. Copy or link that directory into the host's skill directory when distributing the CLI so coding agents consistently claim protected resources before mutation. The skill does not replace lifecycle hooks; automatic turn-end release still depends on `setup`.
+The package also includes the `skills/turngate` agent skill. Copy or link that directory into the host's skill directory when distributing the CLI so coding agents consistently claim protected resources before mutation. The skill does not replace lifecycle hooks; automatic turn-end release still depends on `setup`.
 
 Configure only one host when necessary:
 
 ```bash
-codex-concurrency setup --host codex
-codex-concurrency setup --host claude
+turngate setup --host codex
+turngate setup --host claude
 ```
 
 Preview changes without writing settings:
 
 ```bash
-codex-concurrency setup --dry-run --json
+turngate setup --dry-run --json
 ```
 
 `setup` merges its hook groups into existing `~/.codex/hooks.json` and `~/.claude/settings.json`; it does not replace unrelated hooks. Re-running it updates the installed command paths without adding duplicates.
@@ -77,7 +77,7 @@ Codex requires non-managed command hooks to be reviewed. After setup, open `/hoo
 Validate the installation:
 
 ```bash
-codex-concurrency doctor
+turngate doctor
 ```
 
 ## Commands
@@ -85,15 +85,15 @@ codex-concurrency doctor
 ### `claim`
 
 ```bash
-codex-concurrency claim <resource>... [--label <text>] [--no-wait] [--timeout <duration>] [--poll-interval <duration>] [--json]
+turngate claim <resource>... [--label <text>] [--no-wait] [--timeout <duration>] [--poll-interval <duration>] [--json]
 ```
 
 Examples:
 
 ```bash
-codex-concurrency claim git:branch:main
-codex-concurrency claim git:branch:main deploy:env:production --label "production deploy"
-codex-concurrency claim deploy:env:preview --no-wait
+turngate claim git:branch:main
+turngate claim git:branch:main deploy:env:production --label "production deploy"
+turngate claim deploy:env:preview --no-wait
 ```
 
 Claims wait for up to 10 minutes by default. Durations accept `ms`, `s`, and `m`. `--no-wait` reports an active owner immediately.
@@ -101,7 +101,7 @@ Claims wait for up to 10 minutes by default. Durations accept `ms`, `s`, and `m`
 ### `status`
 
 ```bash
-codex-concurrency status [resource...] [--json]
+turngate status [resource...] [--json]
 ```
 
 `status` first removes owners proven inactive, then shows all gates or the requested resources.
@@ -109,7 +109,7 @@ codex-concurrency status [resource...] [--json]
 ### `setup`
 
 ```bash
-codex-concurrency setup [--host codex|claude|all] [--dry-run] [--json]
+turngate setup [--host codex|claude|all] [--dry-run] [--json]
 ```
 
 The default host is `all`.
@@ -117,7 +117,7 @@ The default host is `all`.
 ### `doctor`
 
 ```bash
-codex-concurrency doctor [--json]
+turngate doctor [--json]
 ```
 
 Checks Node and host availability, hook installation, runtime-state writability, active owner registration, and legacy state.
@@ -142,22 +142,22 @@ A later prompt in the same session supersedes the previous turn. On Claude Code,
 The Git common directory is canonicalized and hashed into a repository ID. Runtime files live under:
 
 ```text
-${CODEX_CONCURRENCY_HOME:-<os-temp>/codex-concurrency}/repositories/<repository-id>/
+${TURNGATE_HOME:-<os-temp>/turngate}/repositories/<repository-id>/
 ```
 
-This location is writable from normal Codex sandboxes on macOS and Windows even when a linked worktree's Git common directory is outside the writable workspace. Set `CODEX_CONCURRENCY_HOME` only when every participating host uses the same override.
+This location is writable from normal Codex sandboxes on macOS and Windows even when a linked worktree's Git common directory is outside the writable workspace. Set `TURNGATE_HOME` only when every participating host uses the same override.
 
 State mutation is serialized with an atomic directory lock. Lock ownership records the writer PID and hostname. A lock is recovered only when its writer is no longer alive; gate ownership itself never expires by time.
 
-## Migrating from 0.1
+## Migrating from codex-concurrency
 
-Version 0.2 intentionally uses a new state format and location. Do not run 0.1 and 0.2 concurrently.
+`turngate` intentionally uses a new command, package, skill, environment-variable prefix, hook path, and runtime directory. Do not run it alongside `codex-concurrency`.
 
 1. Finish all active Codex and Claude Code turns using shared resources.
 2. Upgrade the global package.
-3. Run `codex-concurrency setup --host all`.
+3. Run `turngate setup --host all`; setup replaces managed `codex-concurrency` hooks while preserving unrelated hooks.
 4. Review the Codex hooks with `/hooks`.
-5. Run `codex-concurrency doctor`.
+5. Run `turngate doctor`.
 
 Legacy `.git/codex-concurrency/state.json` files are reported by `doctor` but are not removed or reused.
 

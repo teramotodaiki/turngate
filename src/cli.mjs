@@ -18,7 +18,7 @@ import {
 } from "./core.mjs";
 
 function fail(message) {
-  console.error(`[codex-concurrency] ${message}`);
+  console.error(`[turngate] ${message}`);
   process.exitCode = 1;
 }
 
@@ -46,10 +46,10 @@ function parseArgs(argv) {
 
 function help() {
   console.log(`Usage:
-  codex-concurrency claim <resource>... [--label text] [--no-wait] [--timeout 10m] [--poll-interval 5s] [--json]
-  codex-concurrency status [resource...] [--json]
-  codex-concurrency setup [--host codex|claude|all] [--dry-run] [--json]
-  codex-concurrency doctor [--json]
+  turngate claim <resource>... [--label text] [--no-wait] [--timeout 10m] [--poll-interval 5s] [--json]
+  turngate status [resource...] [--json]
+  turngate setup [--host codex|claude|all] [--dry-run] [--json]
+  turngate doctor [--json]
 
 Claims are tied to the active Codex or Claude Code turn and are released automatically.`);
 }
@@ -83,16 +83,16 @@ async function runClaim(args, paths) {
     const result = await claim(paths, args.positional, claimant);
     if (result.status !== "blocked") {
       if (args.flags.json) print(result, true);
-      else console.log(`[codex-concurrency] ${result.status}: ${result.resources.join(", ")} owner=${ownerSummary(result.owner)}`);
+      else console.log(`[turngate] ${result.status}: ${result.resources.join(", ")} owner=${ownerSummary(result.owner)}`);
       return;
     }
     if (!wait || Date.now() + poll > deadline) {
       if (args.flags.json) print({ ...result, status: wait ? "timeout" : "blocked" }, true);
-      else for (const item of result.blocked) console.error(`[codex-concurrency] ${item.resource} held by ${ownerSummary(item.owner)}`);
+      else for (const item of result.blocked) console.error(`[turngate] ${item.resource} held by ${ownerSummary(item.owner)}`);
       process.exitCode = 1;
       return;
     }
-    console.error(`[codex-concurrency] busy; retrying in ${poll}ms`);
+    console.error(`[turngate] busy; retrying in ${poll}ms`);
     await new Promise((resolvePromise) => setTimeout(resolvePromise, poll));
   }
 }
@@ -103,7 +103,7 @@ export async function runCli(argv = process.argv.slice(2)) {
   if (args.command === "setup") {
     const results = setupHooks({ host: args.flags.host ?? "all", dryRun: Boolean(args.flags["dry-run"]), executablePath: fileURLToPath(import.meta.url) });
     print(results, args.flags.json);
-    if (!args.flags["dry-run"] && results.some((row) => row.provider === "codex" && row.changed)) console.error("[codex-concurrency] review and trust the new Codex hooks with /hooks before claiming gates.");
+    if (!args.flags["dry-run"] && results.some((row) => row.provider === "codex" && row.changed)) console.error("[turngate] review and trust the new Codex hooks with /hooks before claiming gates.");
     return;
   }
   if (args.command === "doctor") {
@@ -128,7 +128,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     if (args.flags.json) print(result, true);
     else {
       const entries = Object.entries(result.gates);
-      if (entries.length === 0) console.log("[codex-concurrency] active gates: none");
+      if (entries.length === 0) console.log("[turngate] active gates: none");
       for (const [resource, owner] of entries) console.log(`${resource}: ${owner ? ownerSummary(owner) : "available"}`);
     }
     return;
@@ -145,4 +145,3 @@ const isMain = (() => {
 })();
 
 if (isMain) runCli().catch((error) => fail(error instanceof Error ? error.message : String(error)));
-

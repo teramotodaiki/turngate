@@ -1,11 +1,11 @@
 ---
-name: codex-concurrency
+name: turngate
 description: Coordinate exclusive repository resources across concurrent Codex and Claude Code turns on macOS or Windows. Use before modifying a shared branch, deployment environment, database schema, generated artifact, or other resource that another local coding-agent turn could also change, and when checking whether such a resource is already owned.
 ---
 
-# Codex Concurrency
+# Turngate
 
-Use `codex-concurrency` to acquire the shared gate before starting protected work. Treat ownership as belonging to the current agent turn, not to the shell or the human user.
+Use `turngate` to acquire the shared gate before starting protected work. Treat ownership as belonging to the current agent turn, not to the shell or the human user.
 
 ## Protect work
 
@@ -13,7 +13,7 @@ Use `codex-concurrency` to acquire the shared gate before starting protected wor
 2. Claim all required resources in one command before the first mutation:
 
    ```sh
-   codex-concurrency claim <resource>...
+   turngate claim <resource>...
    ```
 
 3. If the command waits, do not mutate protected resources while waiting. If it times out or reports another owner, explain the conflict and leave those resources unchanged.
@@ -24,7 +24,7 @@ Claim every resource together when an operation spans multiple targets. Do not c
 
 ## Inspect ownership
 
-Run `codex-concurrency status <resource>...` to inspect specific resources, or `codex-concurrency status` for the repository. Status also prunes owners that are proven inactive.
+Run `turngate status <resource>...` to inspect specific resources, or `turngate status` for the repository. Status also prunes owners that are proven inactive.
 
 Use `--json` only when structured output is useful. Use `--no-wait` when the task must report a conflict immediately rather than wait. Never infer ownership from process names, files, or conversation text when the CLI cannot identify the active turn.
 
@@ -33,12 +33,12 @@ Use `--json` only when structured output is useful. Use `--no-wait` when the tas
 If `claim` cannot identify the active owner or reports missing or untrusted hooks, stop before protected mutation and run:
 
 ```sh
-codex-concurrency doctor
+turngate doctor
 ```
 
 Report the failing check. Do not bypass it with a guessed session ID, a manual state edit, a force option, or a synthetic release.
 
-Treat installation and hook changes as explicit administrative work. Run `codex-concurrency setup --host codex|claude|all` only when the user asks to install or repair integration. Preserve unrelated host hooks. After Codex setup, require the user to review and trust the hook definitions with `/hooks` before relying on claims.
+Treat installation and hook changes as explicit administrative work. Run `turngate setup --host codex|claude|all` only when the user asks to install or repair integration. Preserve unrelated host hooks. After Codex setup, require the user to review and trust the hook definitions with `/hooks` before relying on claims.
 
 On Claude Code, retain ownership when a Stop event reports background tasks or session crons. Consider the turn finished only after it becomes completely quiescent.
 

@@ -1,10 +1,10 @@
 {
-  "name": "codex-concurrency",
+  "name": "turngate",
   "version": "0.2.0",
   "description": "Cross-platform concurrency gates shared by Codex and Claude Code",
   "type": "module",
   "bin": {
-    "codex-concurrency": "./src/cli.mjs"
+    "turngate": "./src/cli.mjs"
   },
   "files": [
     "src",
