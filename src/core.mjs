@@ -193,6 +193,21 @@ function lockIsRecoverable(lockDir) {
   return !pidIsAlive(owner.pid);
 }
 
+async function renameOwnedLock(lockDir, destination, token, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    if (readJson(join(lockDir, "owner.json"), null)?.token !== token) return false;
+    try {
+      renameSync(lockDir, destination);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      if (!["EACCES", "EPERM"].includes(error?.code) || Date.now() >= deadline) throw error;
+      await sleep(10);
+    }
+  }
+}
+
 export async function withDirectoryLock(lockDir, callback, options = {}) {
   const timeoutMs = options.timeoutMs ?? 10_000;
   const pollMs = options.pollMs ?? 25;
@@ -240,8 +255,7 @@ export async function withDirectoryLock(lockDir, callback, options = {}) {
   } finally {
     const releaseDir = `${lockDir}.release-${process.pid}-${token}`;
     try {
-      if (readJson(join(lockDir, "owner.json"), null)?.token === token) {
-        renameSync(lockDir, releaseDir);
+      if (await renameOwnedLock(lockDir, releaseDir, token)) {
         rmSync(releaseDir, { recursive: true });
       }
     } catch (error) {
