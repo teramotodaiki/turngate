@@ -1,13 +1,14 @@
 {
   "name": "codex-concurrency",
-  "version": "0.1.0",
-  "description": "Codex concurrency gate CLI for repo-local operation coordination",
+  "version": "0.2.0",
+  "description": "Cross-platform concurrency gates shared by Codex and Claude Code",
   "type": "module",
   "bin": {
-    "codex-concurrency": "./src/codex-concurrency.mjs"
+    "codex-concurrency": "./src/cli.mjs"
   },
   "files": [
-    "src"
+    "src",
+    "skills"
   ],
   "scripts": {
     "test": "node --test tests/*.test.mjs"
