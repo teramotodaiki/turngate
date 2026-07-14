@@ -2,6 +2,8 @@
 
 `turngate` coordinates shared repository operations across local Codex and Claude Code turns.
 
+Global installation provides Turngate enablement only. It installs passive lifecycle hooks and makes the optional skill available, but it does not require claims in every repository. Each repository must explicitly opt in and define its own protected resources and claim timing.
+
 It supports the four local combinations below with one shared gate state per Git repository:
 
 | Host | macOS | Windows |
@@ -55,7 +57,7 @@ Install the user-level lifecycle hooks for both hosts:
 turngate setup
 ```
 
-The package also includes the `skills/turngate` agent skill. Copy or link that directory into the host's skill directory when distributing the CLI so coding agents consistently claim protected resources before mutation. The skill does not replace lifecycle hooks; automatic turn-end release still depends on `setup`.
+The package also includes the `skills/turngate` enablement skill. Copy or link that directory into the host's global skill directory when distributing the CLI. The global skill never activates locking policy by itself; repository instructions or an explicit user request must opt in. The skill does not replace lifecycle hooks; automatic turn-end release still depends on `setup`.
 
 Configure only one host when necessary:
 
@@ -79,6 +81,25 @@ Validate the installation:
 ```bash
 turngate doctor
 ```
+
+`doctor` reports hook configuration, whether hook execution has actually been observed for the current Codex session, and whether the current turn is registered as an active owner. Codex's private hook-trust decision is not directly introspectable, so Turngate does not label stale lifecycle data as proof of trust.
+
+## Repository opt-in
+
+Global hooks record lifecycle state but do not claim resources or block repository work. A repository that wants protection must add explicit instructions in its own `AGENTS.md`, local skill, or equivalent policy. For example:
+
+```markdown
+## Turngate
+
+This repository explicitly opts in to Turngate for the following operations:
+
+- Before changing local `main`, claim `git:branch:main`.
+- Before changing production traffic, claim `deploy:env:production`.
+- Claim every resource required by one operation in a single command.
+- If a required claim fails, leave those resources unchanged.
+```
+
+Repositories without an explicit opt-in must not run Turngate merely because the global skill is installed. The Turngate source repository itself is not implicitly opted in; maintainers may repair the coordination mechanism without depending on that same mechanism.
 
 ## Commands
 
@@ -133,7 +154,13 @@ cwd, branch, label, claimedAt
 
 Prompt text, assistant text, hook output bodies, credentials, and environment secrets are never copied into gate or lifecycle state.
 
+Turngate also writes one sanitized last-hook observation per agent session under the runtime root. It records only the provider, session and turn identifiers, event name, result state, working directory, timestamp, and an internal failure message. It never copies prompt or assistant bodies. This lets `doctor` distinguish a configured hook from one that actually executed.
+
 Codex ownership uses turn-scoped `UserPromptSubmit` and `Stop` hooks plus Codex session events. Claude Code ownership uses `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, and `SessionEnd`, plus structural transcript markers for interrupted turns.
+
+A Codex automatic or goal continuation can begin a new turn without another `UserPromptSubmit` hook. When the session transcript contains a newer active turn than the stored lifecycle, Turngate derives ownership from that structural `task_started` event. It does not reactivate the same completed turn, and the later `Stop` still releases only the derived turn's gates.
+
+When Turngate is installed or repaired in the middle of an already-running Codex session, that repository may not have an initial lifecycle file. An explicit `doctor` or `claim` can bootstrap the active owner by locating the local transcript whose filename matches `CODEX_THREAD_ID` and reading only its structural turn events. This recovery does not activate Turngate policy for the repository and does not copy prompt or assistant bodies into Turngate state.
 
 A later prompt in the same session supersedes the previous turn. On Claude Code, an exact generated interruption marker also makes the old turn reclaimable. A dead Claude host process is detected with its PID and process-start fingerprint, so PID reuse does not reclaim a live owner incorrectly.
 
@@ -151,7 +178,7 @@ State mutation is serialized with an atomic directory lock. Lock ownership recor
 
 ## Migrating from codex-concurrency
 
-`turngate` intentionally uses a new command, package, skill, environment-variable prefix, hook path, and runtime directory. Do not run it alongside `codex-concurrency`.
+`turngate` intentionally uses a new command, package, skill, environment-variable prefix, hook path, and runtime directory. Do not run it alongside `codex-concurrency`. Migrating the global installation enables Turngate; each repository still requires its own explicit opt-in before agents claim resources there.
 
 1. Finish all active Codex and Claude Code turns using shared resources.
 2. Upgrade the global package.

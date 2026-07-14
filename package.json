@@ -1,6 +1,6 @@
 {
   "name": "turngate",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cross-platform concurrency gates shared by Codex and Claude Code",
   "type": "module",
   "bin": {

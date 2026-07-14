@@ -4,6 +4,7 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -126,8 +127,44 @@ export function getRuntimeRoot(env = process.env) {
   return resolve(env.TURNGATE_HOME || join(tmpdir(), "turngate"));
 }
 
+export function findCodexTranscript(sessionId, { home = homedir(), env = process.env } = {}) {
+  if (!/^[A-Za-z0-9-]{1,128}$/.test(sessionId ?? "")) return "";
+  const codexHome = resolve(env.CODEX_HOME || join(home, ".codex"));
+  const sessionsRoot = join(codexHome, "sessions");
+  const suffix = `-${sessionId}.jsonl`.toLowerCase();
+  const pending = [sessionsRoot];
+  let newest = null;
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(path);
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith(suffix)) {
+        try {
+          const modifiedAt = statSync(path).mtimeMs;
+          if (!newest || modifiedAt > newest.modifiedAt) newest = { path, modifiedAt };
+        } catch {
+          // Ignore files that disappear while sessions are being rotated.
+        }
+      }
+    }
+  }
+  return newest?.path ?? "";
+}
+
 export function getGitCommonDir(cwd = process.cwd()) {
-  const raw = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+  let raw;
+  try {
+    raw = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+  } catch {
+    raw = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+  }
   const absolute = resolve(cwd, raw);
   try {
     return realpathSync(absolute);
@@ -151,6 +188,11 @@ export function getRepositoryPaths(gitCommonDir, runtimeRoot = getRuntimeRoot())
 export function lifecycleFile(paths, provider, sessionId) {
   const id = createHash("sha256").update(`${provider}:${sessionId}`).digest("hex").slice(0, 32);
   return join(paths.lifecycleDir, `${id}.json`);
+}
+
+export function hookObservationFile(runtimeRoot, provider, sessionId) {
+  const id = createHash("sha256").update(`${provider}:${sessionId}`).digest("hex").slice(0, 32);
+  return join(runtimeRoot, "hook-observations", `${id}.json`);
 }
 
 function readJson(file, fallback = null) {
@@ -302,6 +344,30 @@ export function writeLifecycle(paths, lifecycle) {
   writeJsonAtomic(lifecycleFile(paths, lifecycle.provider, lifecycle.sessionId), lifecycle);
 }
 
+function normalizeHookObservation(value) {
+  if (!value || typeof value !== "object" || !value.provider || !value.sessionId) return null;
+  return {
+    version: 1,
+    provider: value.provider,
+    sessionId: value.sessionId,
+    turnId: typeof value.turnId === "string" ? value.turnId : "",
+    event: typeof value.event === "string" ? value.event : "",
+    status: typeof value.status === "string" ? value.status : "unknown",
+    resultStatus: typeof value.resultStatus === "string" ? value.resultStatus : "",
+    error: typeof value.error === "string" ? value.error : "",
+    cwd: typeof value.cwd === "string" ? value.cwd : "",
+    observedAt: typeof value.observedAt === "string" ? value.observedAt : "",
+  };
+}
+
+export function readHookObservation(runtimeRoot, provider, sessionId) {
+  return normalizeHookObservation(readJson(hookObservationFile(runtimeRoot, provider, sessionId), null));
+}
+
+function writeHookObservation(runtimeRoot, observation) {
+  writeJsonAtomic(hookObservationFile(runtimeRoot, observation.provider, observation.sessionId), observation);
+}
+
 function transcriptSize(file) {
   try {
     return statSync(file).size;
@@ -344,19 +410,60 @@ export function readJsonlEvents(file, offset = 0) {
   });
 }
 
-export function codexTurnIsActive(events, turnId) {
-  if (!turnId) return false;
-  let sawTurn = false;
+export function readCodexTurnEvents(file) {
+  if (!file || !existsSync(file)) return [];
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  return text.split(/\r?\n/).filter(Boolean).flatMap((line) => {
+    try {
+      const event = JSON.parse(line);
+      if (event?.type === "turn_context" && typeof event?.payload?.turn_id === "string") {
+        return [{ type: "turn_context", payload: { turn_id: event.payload.turn_id } }];
+      }
+      if (
+        event?.type === "event_msg" &&
+        ["task_started", "task_complete"].includes(event?.payload?.type) &&
+        typeof event?.payload?.turn_id === "string"
+      ) {
+        return [{ type: "event_msg", payload: { type: event.payload.type, turn_id: event.payload.turn_id } }];
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export function activeCodexTurnId(events) {
+  let activeTurnId = "";
   for (const event of events) {
     const startedTurn =
       event?.type === "turn_context" ? event?.payload?.turn_id : event?.type === "event_msg" && event?.payload?.type === "task_started" ? event?.payload?.turn_id : "";
-    if (startedTurn) {
-      if (startedTurn === turnId) sawTurn = true;
-      else if (sawTurn) return false;
-    }
-    if (event?.type === "event_msg" && event?.payload?.type === "task_complete" && event?.payload?.turn_id === turnId) return false;
+    if (startedTurn) activeTurnId = startedTurn;
+    if (event?.type === "event_msg" && event?.payload?.type === "task_complete" && event?.payload?.turn_id === activeTurnId) activeTurnId = "";
   }
-  return sawTurn;
+  return activeTurnId;
+}
+
+export function codexTurnIsActive(events, turnId) {
+  return Boolean(turnId) && activeCodexTurnId(events) === turnId;
+}
+
+function lifecycleWithTranscriptTurn(lifecycle, transcriptEvents) {
+  if (lifecycle?.provider !== "codex" || !lifecycle.transcriptPath) return lifecycle;
+  const transcriptTurnId = activeCodexTurnId(transcriptEvents);
+  if (!transcriptTurnId || transcriptTurnId === lifecycle.turnId) return lifecycle;
+  return {
+    ...lifecycle,
+    turnId: transcriptTurnId,
+    status: "active",
+    completedAt: "",
+    completionReason: "transcript-continuation",
+  };
 }
 
 export function ownerIsActiveFromLifecycle(owner, lifecycle, transcriptEvents = []) {
@@ -370,9 +477,24 @@ export function ownerIsActiveFromLifecycle(owner, lifecycle, transcriptEvents = 
 }
 
 export function ownerIsActive(paths, owner) {
-  const lifecycle = readLifecycle(paths, owner.provider, owner.sessionId);
-  const offset = owner.provider === "claude" && lifecycle?.turnId === owner.turnId ? lifecycle.transcriptOffset : 0;
-  const events = readJsonlEvents(owner.transcriptPath || lifecycle?.transcriptPath || "", offset);
+  const storedLifecycle = readLifecycle(paths, owner.provider, owner.sessionId);
+  const fallbackLifecycle =
+    !storedLifecycle && owner.provider === "codex" && owner.transcriptPath
+      ? {
+          version: 1,
+          provider: owner.provider,
+          sessionId: owner.sessionId,
+          turnId: owner.turnId,
+          status: "active",
+          transcriptPath: owner.transcriptPath,
+          processFingerprint: null,
+        }
+      : null;
+  const baseLifecycle = storedLifecycle ?? fallbackLifecycle;
+  const offset = owner.provider === "claude" && baseLifecycle?.turnId === owner.turnId ? baseLifecycle.transcriptOffset : 0;
+  const transcriptPath = owner.transcriptPath || baseLifecycle?.transcriptPath || "";
+  const events = owner.provider === "codex" ? readCodexTurnEvents(transcriptPath) : readJsonlEvents(transcriptPath, offset);
+  const lifecycle = lifecycleWithTranscriptTurn(baseLifecycle, events);
   return ownerIsActiveFromLifecycle(owner, lifecycle, events);
 }
 
@@ -398,12 +520,55 @@ function detectSessionId(provider, env = process.env) {
   return "";
 }
 
+function discoverCodexLifecycle(sessionId, { home = homedir(), env = process.env, cwd = process.cwd() } = {}) {
+  const transcriptPath = findCodexTranscript(sessionId, { home, env });
+  if (!transcriptPath) return null;
+  const turnId = activeCodexTurnId(readCodexTurnEvents(transcriptPath));
+  if (!turnId) return null;
+  return {
+    version: 1,
+    provider: "codex",
+    sessionId,
+    turnId,
+    status: "active",
+    transcriptPath,
+    cwd,
+    startedAt: "",
+    completedAt: "",
+    transcriptOffset: 0,
+    processFingerprint: null,
+    completionReason: "transcript-discovery",
+  };
+}
+
+function claimableLifecycle(lifecycle) {
+  if (!lifecycle || !lifecycle.turnId) return null;
+  const transcriptOffset = lifecycle.provider === "claude" ? lifecycle.transcriptOffset : 0;
+  const transcriptEvents = lifecycle.transcriptPath
+    ? lifecycle.provider === "codex"
+      ? readCodexTurnEvents(lifecycle.transcriptPath)
+      : readJsonlEvents(lifecycle.transcriptPath, transcriptOffset)
+    : [];
+  const effectiveLifecycle = lifecycleWithTranscriptTurn(lifecycle, transcriptEvents);
+  if (!effectiveLifecycle || !["active", "paused"].includes(effectiveLifecycle.status) || !effectiveLifecycle.turnId) return null;
+  const lifecycleOwner = {
+    provider: effectiveLifecycle.provider,
+    sessionId: effectiveLifecycle.sessionId,
+    turnId: effectiveLifecycle.turnId,
+    transcriptPath: effectiveLifecycle.transcriptPath,
+    processFingerprint: effectiveLifecycle.processFingerprint,
+  };
+  return ownerIsActiveFromLifecycle(lifecycleOwner, effectiveLifecycle, transcriptEvents) ? effectiveLifecycle : null;
+}
+
 export function getClaimant(paths, label = "", env = process.env, cwd = process.cwd()) {
   const provider = detectProvider(env);
   const sessionId = detectSessionId(provider, env);
   if (!provider || !sessionId) throw new Error("active Codex/Claude session could not be identified; run turngate setup and doctor");
-  const lifecycle = readLifecycle(paths, provider, sessionId);
-  if (!lifecycle || !["active", "paused"].includes(lifecycle.status) || !lifecycle.turnId) {
+  const storedLifecycle = readLifecycle(paths, provider, sessionId);
+  const discoveredLifecycle = !storedLifecycle && provider === "codex" ? discoverCodexLifecycle(sessionId, { env, cwd }) : null;
+  const lifecycle = claimableLifecycle(storedLifecycle ?? discoveredLifecycle);
+  if (!lifecycle) {
     throw new Error(`active ${provider} turn is not registered; verify lifecycle hooks with turngate doctor`);
   }
   return {
@@ -510,13 +675,10 @@ function appendClaudeEnvironment(input) {
   appendFileSync(envFile, `${lines.join("\n")}\n`, "utf8");
 }
 
-export async function handleHookEvent(provider, input, options = {}) {
-  if (provider !== "codex" && provider !== "claude") throw new Error(`unsupported hook provider: ${provider}`);
-  const sessionId = typeof input?.session_id === "string" ? input.session_id : "";
-  const cwd = typeof input?.cwd === "string" && input.cwd ? input.cwd : options.cwd ?? process.cwd();
-  if (!sessionId) throw new Error("hook input is missing session_id");
+async function handleHookEventInRepository(provider, input, options, context) {
+  const { sessionId, cwd, runtimeRoot } = context;
   const gitCommonDir = options.gitCommonDir ?? getGitCommonDir(cwd);
-  const paths = options.paths ?? getRepositoryPaths(gitCommonDir, options.runtimeRoot);
+  const paths = options.paths ?? getRepositoryPaths(gitCommonDir, runtimeRoot);
   mkdirSync(paths.repoDir, { recursive: true });
   const event = input.hook_event_name;
 
@@ -541,14 +703,16 @@ export async function handleHookEvent(provider, input, options = {}) {
   }
 
   if (event === "UserPromptSubmit") {
+    const turnId = eventTurnId(provider, input);
+    if (provider === "codex" && !turnId) throw new Error("UserPromptSubmit hook input is missing turn_id");
     const previous = readLifecycle(paths, provider, sessionId);
-    if (previous?.turnId && previous.status !== "completed") await releaseOwnedGates(paths, provider, sessionId, previous.turnId);
+    if (previous?.turnId && previous.turnId !== turnId) await releaseOwnedGates(paths, provider, sessionId, previous.turnId);
     const transcriptPath = input.transcript_path ?? previous?.transcriptPath ?? "";
     const lifecycle = {
       version: 1,
       provider,
       sessionId,
-      turnId: eventTurnId(provider, input),
+      turnId,
       status: "active",
       transcriptPath,
       cwd,
@@ -563,7 +727,21 @@ export async function handleHookEvent(provider, input, options = {}) {
   }
 
   const previous = readLifecycle(paths, provider, sessionId);
-  if (!previous) return { status: "ignored", reason: "session-not-registered" };
+
+  if (["Stop", "StopFailure", "SessionEnd"].includes(event)) {
+    const turnId = provider === "codex" && event !== "SessionEnd" ? (typeof input.turn_id === "string" ? input.turn_id : "") : previous?.turnId ?? "";
+    if (provider === "codex" && event !== "SessionEnd" && !turnId) throw new Error(`${event} hook input is missing turn_id`);
+    if (provider === "codex" && previous?.turnId && turnId !== previous.turnId) {
+      const released = await releaseOwnedGates(paths, provider, sessionId, turnId);
+      return { status: released ? "released" : "ignored", reason: "stale-turn", turnId };
+    }
+    if (!previous) {
+      const released = turnId ? await releaseOwnedGates(paths, provider, sessionId, turnId) : false;
+      return { status: released ? "released" : "ignored", reason: "session-not-registered" };
+    }
+  } else if (!previous) {
+    return { status: "ignored", reason: "session-not-registered" };
+  }
 
   if (provider === "claude" && event === "Stop") {
     const background = Array.isArray(input.background_tasks) ? input.background_tasks : [];
@@ -590,23 +768,65 @@ export async function handleHookEvent(provider, input, options = {}) {
   return { status: "ignored", reason: `unsupported-event:${event}` };
 }
 
-function hookCommand(provider, executablePath, os = platform()) {
-  const escaped = executablePath.replaceAll('"', '\\"');
-  if (os === "win32") return `node \"${escaped}\" hook ${provider}`;
-  return `node ${JSON.stringify(executablePath)} hook ${provider}`;
+export async function handleHookEvent(provider, input, options = {}) {
+  if (provider !== "codex" && provider !== "claude") throw new Error(`unsupported hook provider: ${provider}`);
+  const sessionId = typeof input?.session_id === "string" ? input.session_id : "";
+  const cwd = typeof input?.cwd === "string" && input.cwd ? input.cwd : options.cwd ?? process.cwd();
+  if (!sessionId) throw new Error("hook input is missing session_id");
+  const runtimeRoot = options.runtimeRoot ?? options.paths?.runtimeRoot ?? getRuntimeRoot();
+  const observation = {
+    version: 1,
+    provider,
+    sessionId,
+    turnId: eventTurnId(provider, input),
+    event: typeof input?.hook_event_name === "string" ? input.hook_event_name : "",
+    status: "running",
+    resultStatus: "",
+    error: "",
+    cwd,
+    observedAt: new Date().toISOString(),
+  };
+  writeHookObservation(runtimeRoot, observation);
+  try {
+    const result = await handleHookEventInRepository(provider, input, options, { sessionId, cwd, runtimeRoot });
+    writeHookObservation(runtimeRoot, {
+      ...observation,
+      status: "succeeded",
+      resultStatus: result.status,
+      observedAt: new Date().toISOString(),
+    });
+    return result;
+  } catch (error) {
+    writeHookObservation(runtimeRoot, {
+      ...observation,
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      observedAt: new Date().toISOString(),
+    });
+    throw error;
+  }
 }
 
-function hookHandler(provider, executablePath) {
+function hookCommand(provider, executablePath, nodePath = process.execPath, os = platform()) {
+  if (os === "win32") {
+    const escapedNode = nodePath.replaceAll('"', '\\"');
+    const escapedExecutable = executablePath.replaceAll('"', '\\"');
+    return `\"${escapedNode}\" \"${escapedExecutable}\" hook ${provider}`;
+  }
+  return `${JSON.stringify(nodePath)} ${JSON.stringify(executablePath)} hook ${provider}`;
+}
+
+function hookHandler(provider, executablePath, nodePath = process.execPath) {
   if (provider === "claude") {
     return {
       type: "command",
-      command: process.execPath,
+      command: nodePath,
       args: [executablePath, "hook", provider],
       timeout: 30,
       statusMessage: "Updating turngate ownership",
     };
   }
-  return { type: "command", command: hookCommand(provider, executablePath), timeout: 30, statusMessage: "Updating turngate ownership" };
+  return { type: "command", command: hookCommand(provider, executablePath, nodePath), timeout: 30, statusMessage: "Updating turngate ownership" };
 }
 
 function isManagedHook(hook, provider) {
@@ -620,7 +840,7 @@ function isManagedHook(hook, provider) {
   return isHookInvocation && (managedStatus || markers.some((marker) => command.includes(marker) || directExecutable.includes(marker)));
 }
 
-export function mergeHookConfig(existing, provider, executablePath) {
+export function mergeHookConfig(existing, provider, executablePath, { nodePath = process.execPath } = {}) {
   const next = existing && typeof existing === "object" && !Array.isArray(existing) ? structuredClone(existing) : {};
   next.hooks = next.hooks && typeof next.hooks === "object" && !Array.isArray(next.hooks) ? next.hooks : {};
   const events = provider === "codex" ? ["UserPromptSubmit", "Stop"] : ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"];
@@ -629,7 +849,7 @@ export function mergeHookConfig(existing, provider, executablePath) {
     const filtered = groups.filter(
       (group) => !Array.isArray(group?.hooks) || !group.hooks.some((hook) => isManagedHook(hook, provider)),
     );
-    filtered.push({ hooks: [hookHandler(provider, executablePath)] });
+    filtered.push({ hooks: [hookHandler(provider, executablePath, nodePath)] });
     next.hooks[event] = filtered;
   }
   return next;
@@ -642,7 +862,7 @@ export function setupTargets(home = homedir()) {
   };
 }
 
-export function setupHooks({ host = "all", dryRun = false, home = homedir(), executablePath }) {
+export function setupHooks({ host = "all", dryRun = false, home = homedir(), executablePath, nodePath = process.execPath }) {
   if (!["all", "codex", "claude"].includes(host)) throw new Error(`invalid setup host: ${host}`);
   const targets = setupTargets(home);
   const providers = host === "all" ? ["codex", "claude"] : [host];
@@ -657,7 +877,7 @@ export function setupHooks({ host = "all", dryRun = false, home = homedir(), exe
         throw new Error(`cannot update malformed ${provider} settings: ${file}: ${error.message}`);
       }
     }
-    const merged = mergeHookConfig(existing, provider, executablePath);
+    const merged = mergeHookConfig(existing, provider, executablePath, { nodePath });
     const changed = JSON.stringify(existing) !== JSON.stringify(merged);
     if (!dryRun && changed) writeJsonAtomic(file, merged);
     results.push({ provider, file, changed, dryRun });
@@ -699,6 +919,8 @@ function hasManagedHook(file, provider) {
 export function doctor({ cwd = process.cwd(), home = homedir(), env = process.env } = {}) {
   const checks = [];
   const add = (name, ok, detail) => checks.push({ name, ok, detail });
+  const provider = detectProvider(env);
+  const sessionId = detectSessionId(provider, env);
   add("node", Number(process.versions.node.split(".")[0]) >= 20, process.version);
   add("platform", platform() === "win32" || platform() === "darwin", platform());
   const targets = setupTargets(home);
@@ -717,20 +939,41 @@ export function doctor({ cwd = process.cwd(), home = homedir(), env = process.en
     rmSync(probe);
     add("runtime-state", true, paths.repoDir);
     add("legacy-state", !existsSync(join(common, "codex-concurrency", "state.json")), join(common, "codex-concurrency", "state.json"));
-    const provider = detectProvider(env);
-    const sessionId = detectSessionId(provider, env);
-    const lifecycle = provider && sessionId ? readLifecycle(paths, provider, sessionId) : null;
-    add("active-owner", Boolean(lifecycle?.status === "active" && lifecycle?.turnId), lifecycle ? `${provider}:${sessionId}:${lifecycle.status}` : "not inside a registered turn");
+    const storedLifecycle = provider && sessionId ? readLifecycle(paths, provider, sessionId) : null;
+    const discoveredLifecycle = !storedLifecycle && provider === "codex" && sessionId ? discoverCodexLifecycle(sessionId, { home, env, cwd }) : null;
+    const lifecycle = claimableLifecycle(storedLifecycle ?? discoveredLifecycle);
+    const activeOwner = Boolean(lifecycle);
     add(
-      "codex-hook-trust",
-      provider === "codex" && Boolean(lifecycle?.turnId),
-      provider === "codex" && lifecycle?.turnId ? "verified by a lifecycle event in this turn" : "unverified; review installed hooks with /hooks",
+      "active-owner",
+      activeOwner,
+      lifecycle
+        ? `${provider}:${sessionId}:${lifecycle.status}:turn=${lifecycle.turnId || "missing"}${!storedLifecycle ? ":source=transcript-discovery" : storedLifecycle.turnId !== lifecycle.turnId ? ":source=transcript" : ""}`
+        : storedLifecycle
+          ? `${provider}:${sessionId}:${storedLifecycle.status}:turn=${storedLifecycle.turnId || "missing"}`
+        : provider && sessionId
+          ? `${provider}:${sessionId}:not-registered`
+          : "not inside a registered turn",
+    );
+    const observation = provider === "codex" && sessionId ? readHookObservation(paths.runtimeRoot, provider, sessionId) : null;
+    add(
+      "codex-hook-observed",
+      provider === "codex" && observation?.status === "succeeded",
+      provider !== "codex" || !sessionId
+        ? "not observed; not inside a Codex session"
+        : !observation
+          ? "not observed; review hooks with /hooks, then submit a new prompt"
+          : observation.status === "failed"
+            ? `last ${observation.event || "unknown"} hook failed: ${observation.error || "unknown error"}`
+            : `last ${observation.event || "unknown"} hook ${observation.status}:turn=${observation.turnId || "missing"}:result=${observation.resultStatus || "none"}`,
     );
   } catch (error) {
     add("runtime-state", false, error.message);
   }
+  const optionalChecks = new Set(["legacy-state"]);
+  if (!provider || !sessionId) optionalChecks.add("active-owner");
+  if (provider !== "codex" || !sessionId) optionalChecks.add("codex-hook-observed");
   return {
-    ok: checks.every((check) => check.ok || ["active-owner", "legacy-state", "codex-hook-trust"].includes(check.name)),
+    ok: checks.every((check) => check.ok || optionalChecks.has(check.name)),
     checks,
   };
 }

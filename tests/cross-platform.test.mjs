@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -14,6 +14,7 @@ import {
   createEmptyState,
   doctor,
   getClaimant,
+  getGitCommonDir,
   getRepositoryPaths,
   handleHookEvent,
   isClaudeInterruptEvent,
@@ -23,6 +24,9 @@ import {
   normalizeResourceNames,
   normalizeState,
   ownerIsActiveFromLifecycle,
+  readCodexTurnEvents,
+  readHookObservation,
+  readLifecycle,
   repositoryId,
   sameOwner,
   setupHooks,
@@ -197,12 +201,193 @@ test("Codex Stop releases the exact turn", async () => {
   assert.deepEqual((await status(repoPaths)).gates, {});
 });
 
+test("Git common dir canonicalizes Windows short path aliases", { skip: process.platform !== "win32" }, async () => {
+  const shortRepo = temporaryDirectory("turngate-path-alias-");
+  await execFileAsync("git", ["init", "--quiet", shortRepo]);
+  const { stdout } = await execFileAsync("git", ["-C", shortRepo, "rev-parse", "--show-toplevel"]);
+  const longRepo = stdout.trim();
+
+  assert.equal(getGitCommonDir(shortRepo), getGitCommonDir(longRepo));
+  assert.equal(repositoryId(getGitCommonDir(shortRepo)), repositoryId(getGitCommonDir(longRepo)));
+});
+
+test("Codex next prompt reactivates a completed session", async () => {
+  const repoPaths = paths();
+  const base = { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" };
+  await handleHookEvent("codex", { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-1", transcript_path: "", cwd: "C:/fake" }, base);
+  await handleHookEvent("codex", { hook_event_name: "Stop", session_id: "s", turn_id: "turn-1", cwd: "C:/fake" }, base);
+  await handleHookEvent("codex", { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-2", transcript_path: "", cwd: "C:/fake" }, base);
+
+  const lifecycle = readLifecycle(repoPaths, "codex", "s");
+  assert.equal(lifecycle.status, "active");
+  assert.equal(lifecycle.turnId, "turn-2");
+  assert.equal(lifecycle.completedAt, "");
+});
+
+test("a stale Codex Stop cannot complete or release the newer turn", async () => {
+  const repoPaths = paths();
+  const base = { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" };
+  await handleHookEvent("codex", { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-1", transcript_path: "", cwd: "C:/fake" }, base);
+  await handleHookEvent("codex", { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-2", transcript_path: "", cwd: "C:/fake" }, base);
+  const claimant = getClaimant(repoPaths, "new turn", { CODEX_THREAD_ID: "s" }, "C:/fake");
+  await claim(repoPaths, ["git:main"], claimant);
+
+  const stale = await handleHookEvent("codex", { hook_event_name: "Stop", session_id: "s", turn_id: "turn-1", cwd: "C:/fake" }, base);
+
+  assert.equal(stale.status, "ignored");
+  assert.equal(stale.reason, "stale-turn");
+  assert.equal(readLifecycle(repoPaths, "codex", "s").turnId, "turn-2");
+  assert.equal(readLifecycle(repoPaths, "codex", "s").status, "active");
+  assert.equal((await status(repoPaths)).gates["git:main"].turnId, "turn-2");
+});
+
+test("Codex claimant adopts the newer active transcript turn", async () => {
+  const repoPaths = paths();
+  const transcript = join(temporaryDirectory(), "codex.jsonl");
+  writeFileSync(
+    transcript,
+    [
+      { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+      { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+    ].map((event) => JSON.stringify(event)).join("\n"),
+  );
+  await handleHookEvent(
+    "codex",
+    { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-1", transcript_path: transcript, cwd: "C:/fake" },
+    { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" },
+  );
+
+  assert.equal(getClaimant(repoPaths, "continued", { CODEX_THREAD_ID: "s" }, "C:/fake").turnId, "turn-2");
+});
+
+test("Codex automatic continuation remains claimable and its Stop releases gates", async () => {
+  const home = temporaryDirectory();
+  const runtime = temporaryDirectory("turngate-codex-continuation-");
+  const transcript = join(temporaryDirectory(), "codex.jsonl");
+  const common = getGitCommonDir(process.cwd());
+  const repoPaths = getRepositoryPaths(common, runtime);
+  const base = { paths: repoPaths, gitCommonDir: common, cwd: process.cwd(), runtimeRoot: runtime };
+  setupHooks({ host: "all", home, executablePath: "C:/tool/cli.mjs" });
+  writeFileSync(transcript, `${JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } })}\n`);
+  await handleHookEvent(
+    "codex",
+    { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-1", transcript_path: transcript, cwd: process.cwd() },
+    base,
+  );
+  await handleHookEvent("codex", { hook_event_name: "Stop", session_id: "s", turn_id: "turn-1", cwd: process.cwd() }, base);
+  writeFileSync(
+    transcript,
+    [
+      { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+      { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+    ].map((event) => JSON.stringify(event)).join("\n"),
+  );
+
+  const claimant = getClaimant(repoPaths, "automatic continuation", { CODEX_THREAD_ID: "s" }, process.cwd());
+  assert.equal(claimant.turnId, "turn-2");
+  await claim(repoPaths, ["git:main"], claimant);
+  assert.equal((await status(repoPaths)).gates["git:main"].turnId, "turn-2");
+  const activeDoctor = doctor({ cwd: process.cwd(), home, env: { ...process.env, TURNGATE_HOME: runtime, CODEX_THREAD_ID: "s" } });
+  assert.equal(activeDoctor.checks.find((check) => check.name === "active-owner").ok, true);
+  assert.match(activeDoctor.checks.find((check) => check.name === "active-owner").detail, /source=transcript/);
+
+  const stopped = await handleHookEvent("codex", { hook_event_name: "Stop", session_id: "s", turn_id: "turn-2", cwd: process.cwd() }, base);
+  assert.equal(stopped.status, "released");
+  assert.equal(stopped.reason, "stale-turn");
+  assert.deepEqual((await status(repoPaths)).gates, {});
+});
+
+test("Codex transcript discovery bootstraps a session that predates hook setup", async () => {
+  const home = temporaryDirectory();
+  const codexHome = join(home, ".codex");
+  const transcriptDirectory = join(codexHome, "sessions", "2026", "07", "14");
+  const transcript = join(transcriptDirectory, "rollout-2026-07-14T00-00-00-s.jsonl");
+  const runtime = temporaryDirectory("turngate-codex-discovery-");
+  const common = getGitCommonDir(process.cwd());
+  const repoPaths = getRepositoryPaths(common, runtime);
+  const base = { paths: repoPaths, gitCommonDir: common, cwd: process.cwd(), runtimeRoot: runtime };
+  const env = { ...process.env, CODEX_HOME: codexHome, CODEX_THREAD_ID: "s", TURNGATE_HOME: runtime };
+  mkdirSync(transcriptDirectory, { recursive: true });
+  writeFileSync(transcript, `${JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-discovered" } })}\n`);
+  setupHooks({ host: "all", home, executablePath: "C:/tool/cli.mjs" });
+
+  const claimant = getClaimant(repoPaths, "discovered", env, process.cwd());
+  assert.equal(claimant.turnId, "turn-discovered");
+  assert.equal(claimant.transcriptPath, transcript);
+  await claim(repoPaths, ["git:main"], claimant);
+  assert.equal((await status(repoPaths)).gates["git:main"].turnId, "turn-discovered");
+  const activeDoctor = doctor({ cwd: process.cwd(), home, env });
+  assert.equal(activeDoctor.checks.find((check) => check.name === "active-owner").ok, true);
+  assert.match(activeDoctor.checks.find((check) => check.name === "active-owner").detail, /source=transcript-discovery/);
+
+  const stopped = await handleHookEvent(
+    "codex",
+    { hook_event_name: "Stop", session_id: "s", turn_id: "turn-discovered", cwd: process.cwd() },
+    base,
+  );
+  assert.equal(stopped.status, "released");
+  assert.equal(stopped.reason, "session-not-registered");
+  assert.deepEqual((await status(repoPaths)).gates, {});
+});
+
+test("Codex transcript activity parsing discards non-structural bodies", () => {
+  const transcript = join(temporaryDirectory(), "codex-private.jsonl");
+  writeFileSync(
+    transcript,
+    [
+      { type: "response_item", payload: { role: "user", content: "must-not-be-returned" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: "turn-1", message: "also-private" } },
+    ].map((event) => JSON.stringify(event)).join("\n"),
+  );
+
+  const events = readCodexTurnEvents(transcript);
+  assert.deepEqual(events, [{ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } }]);
+  assert.doesNotMatch(JSON.stringify(events), /private|must-not-be-returned/);
+});
+
+test("Claude claimant ignores interruption markers from earlier turns", async () => {
+  const repoPaths = paths();
+  const transcript = join(temporaryDirectory(), "claude.jsonl");
+  writeFileSync(transcript, `${JSON.stringify({ type: "user", message: { content: "[Request interrupted by user]" } })}\n`);
+  await handleHookEvent(
+    "claude",
+    { hook_event_name: "UserPromptSubmit", session_id: "s", prompt_id: "turn-2", transcript_path: transcript, cwd: "C:/fake" },
+    { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" },
+  );
+
+  const claimant = getClaimant(repoPaths, "current", { TURNGATE_PROVIDER: "claude", TURNGATE_SESSION_ID: "s" }, "C:/fake");
+  assert.equal(claimant.turnId, "turn-2");
+});
+
+test("hook failures are recorded without prompt or assistant bodies", async () => {
+  const repoPaths = paths();
+  await assert.rejects(
+    handleHookEvent(
+      "codex",
+      { hook_event_name: "UserPromptSubmit", session_id: "s", cwd: "C:/fake", prompt: "must-not-be-stored" },
+      { paths: repoPaths, gitCommonDir: "C:/fake/.git", cwd: "C:/fake" },
+    ),
+    /missing turn_id/,
+  );
+
+  const observation = readHookObservation(repoPaths.runtimeRoot, "codex", "s");
+  assert.equal(observation.status, "failed");
+  assert.equal(observation.event, "UserPromptSubmit");
+  assert.equal(observation.turnId, "");
+  assert.doesNotMatch(JSON.stringify(observation), /must-not-be-stored/);
+});
+
 test("setup merges existing hooks, is idempotent, and dry-run does not write", () => {
   const home = temporaryDirectory();
   const codexFile = join(home, ".codex", "hooks.json");
   const first = setupHooks({ host: "codex", home, executablePath: "C:/tool/cli.mjs" });
   assert.equal(first[0].changed, true);
   const config = JSON.parse(readFileSync(codexFile, "utf8"));
+  const installedCommand = config.hooks.UserPromptSubmit[0].hooks[0].command;
+  assert.match(installedCommand, /node(?:\.exe)?/i);
+  assert.doesNotMatch(installedCommand, /^node\s/i);
   config.hooks.Stop.unshift({ hooks: [{ type: "command", command: "existing-hook" }] });
   writeFileSync(codexFile, JSON.stringify(config));
   const second = setupHooks({ host: "codex", home, executablePath: "C:/tool/cli.mjs" });
@@ -268,14 +453,30 @@ test("version checks resolve Windows command shims through cmd.exe", () => {
   assert.equal(invocation.options.shell, undefined);
 });
 
-test("doctor reports missing hooks, trust state, and a writable runtime", () => {
+test("doctor reports missing hooks, execution state, and a writable runtime", () => {
   const home = temporaryDirectory();
   const runtime = temporaryDirectory("turngate-doctor-");
   const result = doctor({ cwd: process.cwd(), home, env: { ...process.env, TURNGATE_HOME: runtime, CODEX_THREAD_ID: "" } });
   assert.equal(result.checks.find((check) => check.name === "codex-hooks").ok, false);
   assert.equal(result.checks.find((check) => check.name === "claude-hooks").ok, false);
   assert.equal(result.checks.find((check) => check.name === "runtime-state").ok, true);
-  assert.match(result.checks.find((check) => check.name === "codex-hook-trust").detail, /unverified/);
+  assert.match(result.checks.find((check) => check.name === "codex-hook-observed").detail, /not observed/);
+});
+
+test("doctor fails when the current Codex session is completed", async () => {
+  const home = temporaryDirectory();
+  const runtime = temporaryDirectory("turngate-doctor-active-");
+  setupHooks({ host: "all", home, executablePath: "C:/tool/cli.mjs" });
+  const common = getGitCommonDir(process.cwd());
+  const repoPaths = getRepositoryPaths(common, runtime);
+  const base = { paths: repoPaths, gitCommonDir: common, cwd: process.cwd(), runtimeRoot: runtime };
+  await handleHookEvent("codex", { hook_event_name: "UserPromptSubmit", session_id: "s", turn_id: "turn-1", transcript_path: "", cwd: process.cwd() }, base);
+  await handleHookEvent("codex", { hook_event_name: "Stop", session_id: "s", turn_id: "turn-1", cwd: process.cwd() }, base);
+
+  const result = doctor({ cwd: process.cwd(), home, env: { ...process.env, TURNGATE_HOME: runtime, CODEX_THREAD_ID: "s" } });
+  assert.equal(result.checks.find((check) => check.name === "codex-hook-observed").ok, true);
+  assert.equal(result.checks.find((check) => check.name === "active-owner").ok, false);
+  assert.equal(result.ok, false);
 });
 
 test("lifecycle file names do not expose provider session ids", () => {

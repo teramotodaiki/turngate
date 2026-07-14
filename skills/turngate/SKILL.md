@@ -1,50 +1,38 @@
 ---
 name: turngate
-description: Coordinate exclusive repository resources across concurrent Codex and Claude Code turns on macOS or Windows. Use before modifying a shared branch, deployment environment, database schema, generated artifact, or other resource that another local coding-agent turn could also change, and when checking whether such a resource is already owned.
+description: Enable Turngate workflows for Codex and Claude Code. Use this skill only when the user explicitly requests Turngate or the current repository instructions explicitly opt in; global installation alone never activates locking policy.
 ---
 
-# Turngate
+# Turngate enablement
 
-Use `turngate` to acquire the shared gate before starting protected work. Treat ownership as belonging to the current agent turn, not to the shell or the human user.
+This global skill makes Turngate available. It does not decide that a repository must use Turngate.
 
-## Protect work
+## Activation boundary
 
-1. Identify every resource the operation will mutate. Use stable, explicit names such as `git:branch:main`, `deploy:env:production`, or `database:schema:voicebot`.
-2. Claim all required resources in one command before the first mutation:
+- Do not run any `turngate` command merely because this skill is installed, a branch is shared, or a deployment is sensitive.
+- Activate Turngate only when the current user request explicitly names it or current repository instructions explicitly opt in.
+- Repository instructions own the protected resource names, claim timing, and required verification. Do not invent policy that the repository has not declared.
+- If no explicit opt-in exists, continue without Turngate and do not block the task on Turngate diagnostics.
+- The Turngate source repository is not automatically opted in to protecting its own development.
 
-   ```sh
-   turngate claim <resource>...
-   ```
+## When a repository opts in
 
-3. If the command waits, do not mutate protected resources while waiting. If it times out or reports another owner, explain the conflict and leave those resources unchanged.
-4. Perform protected work only after the claim succeeds.
-5. Do not release the gate manually. The host hook MUST release it when the turn ends. Recover interruption or host failure automatically at the next `claim` or `status` observation.
+Follow that repository's instructions exactly. When they require a claim:
 
-Claim every resource together when an operation spans multiple targets. Do not claim them one by one because another turn could acquire a partial set between commands.
+1. Claim every declared resource atomically with `turngate claim <resource>...` before the protected mutation.
+2. If the claim waits, blocks, or times out, leave the declared resources unchanged and report the identified owner.
+3. Keep ownership through the repository-required verification steps.
+4. Let the host lifecycle hook release ownership at turn end. Do not synthesize or force a release.
 
-## Inspect ownership
+Use `turngate status <resource>...` only when the user or repository policy asks for ownership inspection. Never treat an available gate as proof that the current turn is registered; use `turngate doctor` when a required claim cannot identify the active turn.
 
-Run `turngate status <resource>...` to inspect specific resources, or `turngate status` for the repository. Status also prunes owners that are proven inactive.
+## Setup support
 
-Use `--json` only when structured output is useful. Use `--no-wait` when the task must report a conflict immediately rather than wait. Never infer ownership from process names, files, or conversation text when the CLI cannot identify the active turn.
+Installation and hook changes are administrative enablement, not repository activation. Run `turngate setup --host codex|claude|all` only when the user explicitly asks to install or repair Turngate. Preserve unrelated hooks. After changing a Codex hook definition, ask the user to review and trust its new hash with `/hooks`.
 
-## Handle lifecycle and setup
+`turngate doctor` distinguishes configuration, observed hook execution, and active ownership. It cannot read Codex's private trust decision directly; a successful observed hook event is runtime evidence that the hook executed.
 
-If `claim` cannot identify the active owner or reports missing or untrusted hooks, stop before protected mutation and run:
-
-```sh
-turngate doctor
-```
-
-Report the failing check. Do not bypass it with a guessed session ID, a manual state edit, a force option, or a synthetic release.
-
-Treat installation and hook changes as explicit administrative work. Run `turngate setup --host codex|claude|all` only when the user asks to install or repair integration. Preserve unrelated host hooks. After Codex setup, require the user to review and trust the hook definitions with `/hooks` before relying on claims.
-
-On Claude Code, retain ownership when a Stop event reports background tasks or session crons. Consider the turn finished only after it becomes completely quiescent.
-
-## Safety rules
+## Data boundary
 
 - Never store or echo prompt bodies, assistant bodies, or credentials as gate metadata.
-- Never expose or add a normal-use `release` or `--force` workflow.
-- Never mutate a protected resource after a failed, blocked, or timed-out claim.
-- Keep the claim through verification steps in the same protected operation; automatic turn-end release is mandatory.
+- Gate and hook state may contain only structural lifecycle metadata and sanitized error messages.
